@@ -21,9 +21,13 @@ PORT = int(os.environ.get("PORT", "8080"))
 # Frankfurter's ECB series starts on this date; anything earlier has no data.
 SERIES_START = date(1999, 1, 4)
 
-app = FastAPI(title="fx-tool", version="0.1")
+app = FastAPI(title="fx-tool", version="1.0")
 
 client = httpx.AsyncClient(base_url=UPSTREAM_BASE, timeout=5.0)
+
+# Simple in-process cache: same (from, to, date) question is answered from
+# memory instead of hitting the upstream API again.
+_cache: dict[tuple[str, str, str], dict] = {}
 
 
 def error(status_code: int, code: str, message: str) -> JSONResponse:
@@ -91,6 +95,11 @@ async def convert(
             "source": "ECB via frankfurter.dev",
         }
 
+    cache_key = (from_code, to_code, asked_date.isoformat() if asked_date else "latest")
+    if cache_key in _cache:
+        cached = _cache[cache_key]
+        return {**cached, "amount": amount, "result": round(amount * cached["rate"], 2)}
+
     path = asked_date.isoformat() if asked_date else "latest"
     try:
         response = await client.get(f"/v1/{path}", params={"base": from_code, "symbols": to_code})
@@ -134,15 +143,20 @@ async def convert(
     rate = rates[to_code]
     actual_rate_date = payload.get("date", (asked_date or today).isoformat())
 
-    return {
-        "amount": amount,
+    result_payload = {
         "from": from_code,
         "to": to_code,
         "rate": rate,
-        "result": round(amount * rate, 2),
         "rate_date": actual_rate_date,
         "asked_date": (asked_date or today).isoformat(),
         "source": "ECB via frankfurter.dev",
+    }
+    _cache[cache_key] = result_payload
+
+    return {
+        **result_payload,
+        "amount": amount,
+        "result": round(amount * rate, 2),
     }
 
 
