@@ -92,10 +92,48 @@ async def convert(
         }
 
     path = asked_date.isoformat() if asked_date else "latest"
-    response = await client.get(f"/v1/{path}", params={"base": from_code, "symbols": to_code})
-    payload = response.json()
-    rate = payload["rates"][to_code]
+    try:
+        response = await client.get(f"/v1/{path}", params={"base": from_code, "symbols": to_code})
+    except httpx.RequestError:
+        return error(
+            502,
+            "upstream_unavailable",
+            "Could not reach the exchange rate provider. Please try again.",
+        )
+
+    if response.status_code >= 500:
+        return error(
+            502,
+            "upstream_unavailable",
+            "The exchange rate provider is currently unavailable.",
+        )
+    if response.status_code >= 400:
+        return error(
+            400,
+            "invalid_currency",
+            "One of the currency codes is not recognized by the rate provider.",
+        )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return error(
+            502,
+            "upstream_error",
+            "The exchange rate provider returned an unreadable response.",
+        )
+
+    rates = payload.get("rates", {})
+    if to_code not in rates:
+        return error(
+            404,
+            "rate_not_found",
+            f"No rate is available for {from_code} to {to_code}.",
+        )
+
+    rate = rates[to_code]
     actual_rate_date = payload.get("date", (asked_date or today).isoformat())
+
     return {
         "amount": amount,
         "from": from_code,
