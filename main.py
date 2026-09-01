@@ -18,6 +18,9 @@ from fastapi.responses import JSONResponse
 UPSTREAM_BASE = os.environ.get("FX_UPSTREAM_BASE", "https://api.frankfurter.dev")
 PORT = int(os.environ.get("PORT", "8080"))
 
+# Frankfurter's ECB series starts on this date; anything earlier has no data.
+SERIES_START = date(1999, 1, 4)
+
 app = FastAPI(title="fx-tool", version="0.1")
 
 client = httpx.AsyncClient(base_url=UPSTREAM_BASE, timeout=5.0)
@@ -30,8 +33,6 @@ def error(status_code: int, code: str, message: str) -> JSONResponse:
 def is_valid_amount(amount: float) -> bool:
     if amount <= 0:
         return False
-    # Reject amounts with more than 2 decimal places (e.g. 10-decimal
-    # floating point noise). Currency amounts realistically don't need more.
     cents = round(amount * 100)
     return abs(amount * 100 - cents) < 1e-6
 
@@ -47,6 +48,7 @@ async def convert(
     to: str = Query(...),
     date_param: date | None = Query(None, alias="date"),
 ):
+    asked_date = date_param
     from_code = from_.upper()
     to_code = to.upper()
 
@@ -64,17 +66,44 @@ async def convert(
             "Currency codes must be 3-letter ISO codes, e.g. EUR, TRY.",
         )
 
-    path = date_param.isoformat() if date_param else "latest"
+    today = date.today()
+    if asked_date is not None:
+        if asked_date > today:
+            return error(400, "invalid_date", "The date cannot be in the future.")
+        if asked_date < SERIES_START:
+            return error(
+                400,
+                "invalid_date",
+                f"No rates are published before {SERIES_START.isoformat()}.",
+            )
+
+    # Same-currency shortcut: no need to ask the upstream at all.
+    if from_code == to_code:
+        result_date = (asked_date or today).isoformat()
+        return {
+            "amount": amount,
+            "from": from_code,
+            "to": to_code,
+            "rate": 1.0,
+            "result": round(amount, 2),
+            "rate_date": result_date,
+            "asked_date": result_date,
+            "source": "ECB via frankfurter.dev",
+        }
+
+    path = asked_date.isoformat() if asked_date else "latest"
     response = await client.get(f"/v1/{path}", params={"base": from_code, "symbols": to_code})
     payload = response.json()
     rate = payload["rates"][to_code]
+    actual_rate_date = payload.get("date", (asked_date or today).isoformat())
     return {
         "amount": amount,
         "from": from_code,
         "to": to_code,
         "rate": rate,
         "result": round(amount * rate, 2),
-        "rate_date": payload.get("date"),
+        "rate_date": actual_rate_date,
+        "asked_date": (asked_date or today).isoformat(),
         "source": "ECB via frankfurter.dev",
     }
 
